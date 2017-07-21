@@ -172,6 +172,13 @@ func (tp *TransactionPool) purge() {
 func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 	tp.mu.Lock()
 
+	conflictingSets := make(map[TransactionSetID]struct{})
+	unconfidentSets := make(map[TransactionSetID]struct{})
+	okSets := make(map[TransactionSetID]struct{})
+
+	removedObjectIDs := make(map[ObjectID]struct{})
+	confirmedObjectIDs := make(map[ObjectID]struct{})
+	var revertedTxns []types.Transaction
 	// Update the database of confirmed transactions.
 	for _, block := range cc.RevertedBlocks {
 		if tp.blockHeight > 0 || block.ID() != types.GenesisID {
@@ -182,6 +189,31 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 			if err != nil {
 				tp.log.Println("ERROR: could not delete a transaction:", err)
 			}
+
+			//Place all objects from this txn into the set of removed objects.
+			for _, sci := range txn.SiacoinInputs {
+				removedObjectIDs[ObjectID(sci.ParentID)] = struct{}{}
+			}
+			for i := range txn.SiacoinOutputs {
+				removedObjectIDs[ObjectID(txn.SiacoinOutputID(uint64(i)))] = struct{}{}
+			}
+			for i := range txn.FileContracts {
+				removedObjectIDs[ObjectID(txn.FileContractID(uint64(i)))] = struct{}{}
+			}
+			for _, fcr := range txn.FileContractRevisions {
+				removedObjectIDs[ObjectID(fcr.ParentID)] = struct{}{}
+			}
+			for _, sp := range txn.StorageProofs {
+				removedObjectIDs[ObjectID(sp.ParentID)] = struct{}{}
+			}
+			for _, sfi := range txn.SiafundInputs {
+				removedObjectIDs[ObjectID(sfi.ParentID)] = struct{}{}
+			}
+			for i := range txn.SiafundOutputs {
+				removedObjectIDs[ObjectID(txn.SiafundOutputID(uint64(i)))] = struct{}{}
+			}
+
+			revertedTxns = append(revertedTxns, txn)
 		}
 
 		// Pull the transactions out of the fee summary. For estimating only
@@ -201,6 +233,29 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 			err := tp.putTransaction(tp.dbTx, txn.ID())
 			if err != nil {
 				tp.log.Println("ERROR: could not add a transaction:", err)
+			}
+
+			//Place all objects from this txn into the set of confirmed objects.
+			for _, sci := range txn.SiacoinInputs {
+				confirmedObjectIDs[ObjectID(sci.ParentID)] = struct{}{}
+			}
+			for i := range txn.SiacoinOutputs {
+				confirmedObjectIDs[ObjectID(txn.SiacoinOutputID(uint64(i)))] = struct{}{}
+			}
+			for i := range txn.FileContracts {
+				confirmedObjectIDs[ObjectID(txn.FileContractID(uint64(i)))] = struct{}{}
+			}
+			for _, fcr := range txn.FileContractRevisions {
+				confirmedObjectIDs[ObjectID(fcr.ParentID)] = struct{}{}
+			}
+			for _, sp := range txn.StorageProofs {
+				confirmedObjectIDs[ObjectID(sp.ParentID)] = struct{}{}
+			}
+			for _, sfi := range txn.SiafundInputs {
+				confirmedObjectIDs[ObjectID(sfi.ParentID)] = struct{}{}
+			}
+			for i := range txn.SiafundOutputs {
+				confirmedObjectIDs[ObjectID(txn.SiafundOutputID(uint64(i)))] = struct{}{}
 			}
 		}
 
@@ -286,6 +341,120 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 		tp.log.Println("ERROR: could not update the transaction pool median fee information:", err)
 	}
 
+	////////////////////////////////////////////////////////////////////////////
+	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO //
+	//////////////////////////////////////////////////////////////////////////
+
+	for setID, set := range tp.transactionSets {
+		// TODO: Might be better to only consider parent objects, and then write a
+		// relatedParentObjectIDS function. Need to think more about correctness
+		// first.
+
+		// can we remove children from the set? i.e. not throw the whole thing
+		// out if the parents are still valid?
+
+		// iterate over all transactions
+		// if the any parent object ID of this transaction was removed and not
+		// added back, throw away the transaction
+		//  if any child of this transaction was added or removed, throw this
+		//  away ( this should not happen) }
+
+		var setObjects []ObjectID
+		for _, txn := range set {
+			txnObjects := relatedObjectIDs([]types.Transaction{txn})
+			setObjects = append(setObjects, txnObjects...)
+		}
+
+		for _, objID := range setObjects {
+			if _, removed := removedObjectIDs[objID]; removed {
+				// If the object was removed and then added by the consensus
+				// change, check this set more carefully.
+				if _, applied := confirmedObjectIDs[objID]; applied {
+					unconfidentSets[setID] = struct{}{}
+				} else {
+					// One of the objects from this set was removed!
+					conflictingSets[setID] = struct{}{}
+					break
+				}
+			}
+		}
+
+		//TODO: check the logic heree !!
+
+		// Prune transactions older than maxTxnAge.
+		var validTxns []types.Transaction
+		for _, txn := range set {
+			seenHeight, seen := tp.transactionHeights[txn.ID()]
+			if tp.blockHeight-seenHeight <= maxTxnAge || !seen {
+				validTxns = append(validTxns, txn)
+			} else {
+				delete(tp.transactionHeights, txn.ID())
+			}
+		}
+		// If some of the transactions need to be pruned, we'll go ahead and
+		// check the whole set properly. Otherwise the set is good to go.
+		if len(validTxns) != len(set) {
+			unconfidentSets[setID] = struct{}{}
+		}
+	}
+
+	for _, txn := range revertedTxns {
+		setObjects := relatedObjectIDs([]types.Transaction{txn})
+
+		// Remove if it's too old, else try accepting it.
+		seenHeight, seen := tp.transactionHeights[txn.ID()]
+		if tp.blockHeight-seenHeight <= maxTxnAge || !seen {
+			err := tp.acceptTransactionSet([]types.Transaction{txn}, cc.TryTransactionSet)
+			if err == nil {
+				// The transaction is no longer valid, delete it from the
+				// heights map to prevent a memory leak.
+				delete(tp.transactionHeights, txn.ID())
+				break // TODO: this breaks as expected right?
+			}
+		}
+
+		var conflicting bool
+		for _, objID := range setObjects {
+			if _, removed := removedObjectIDs[objID]; removed {
+				// If the object was removed and then added by the consensus
+				// change, check this set more carefully.
+				if _, applied := confirmedObjectIDs[objID]; !applied {
+					conflicting = true
+					delete(tp.transactionHeights, txn.ID())
+					break
+				}
+			}
+		}
+		if !conflicting {
+			// Try adding the transaction back into the transaction pool.
+			tp.acceptTransactionSet([]types.Transaction{txn}, cc.TryTransactionSet) // Error is ignored.
+		}
+	}
+
+	//TODO: Make sure to check againsts errors so you can prevent memory leaks
+	//TODO: MAke a diff for subscrbiers?
+	// Remove any conflicting sets from the transaction pool.
+	for setID, set := range tp.transactionSets {
+		if _, conflicts := conflictingSets[setID]; conflicts {
+			//remove
+			// purge does this:``
+			// //TODO: make a get children object id function, these are knownObjects to get rid of as well
+			// tp.knownObjects = make(map[ObjectID]TransactionSetID)
+			// tp.transactionSets = make(map[TransactionSetID][]types.Transaction)
+			// tp.transactionSetDiffs = make(map[TransactionSetID]*modules.ConsensusChange)
+			// tp.transactionListSize = 0
+			break
+		}
+		if _, unsure := unconfidentSets[setID]; unsure {
+			// Try accepting any sets we are not confident about including.
+			// if err != nil, delete as above
+			break
+		}
+
+		//try pruning this bad boy and accepting if pruned
+		// if no pruning necessary then leave as is.
+	}
+
 	// Scan the applied blocks for transactions that got accepted. This will
 	// help to determine which transactions to remove from the transaction
 	// pool. Having this list enables both efficiency improvements and helps to
@@ -319,20 +488,6 @@ func (tp *TransactionPool) ProcessConsensusChange(cc modules.ConsensusChange) {
 	// Purge the transaction pool. Some of the transactions sets may be invalid
 	// after the consensus change.
 	tp.purge()
-
-	// prune transactions older than maxTxnAge.
-	for i, tSet := range unconfirmedSets {
-		var validTxns []types.Transaction
-		for _, txn := range tSet {
-			seenHeight, seen := tp.transactionHeights[txn.ID()]
-			if tp.blockHeight-seenHeight <= maxTxnAge || !seen {
-				validTxns = append(validTxns, txn)
-			} else {
-				delete(tp.transactionHeights, txn.ID())
-			}
-		}
-		unconfirmedSets[i] = validTxns
-	}
 
 	// Scan through the reverted blocks and re-add any transactions that got
 	// reverted to the tpool.

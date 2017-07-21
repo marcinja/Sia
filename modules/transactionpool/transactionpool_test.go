@@ -599,8 +599,6 @@ func TestHeapFees(t *testing.T) {
 	avgFee1 := totalFee1.Div64(uint64(numTxns1))
 	if totalFee1.Cmp(expectedFee1) != 0 {
 		t.Error("totalFee1 different than expected fee.", totalFee1.String(), expectedFee1.String())
-		//t.Log(totalFee1.Sub(expectedFee1).HumanString())
-
 	}
 
 	// Mine the next block so we can check the transactions inside
@@ -684,7 +682,7 @@ func TestBigTpool(t *testing.T) {
 	// Create transaction graph setup.
 	coinFrac := types.SiacoinPrecision.Div64(1)
 	feeFrac := types.SiacoinPrecision.Div64(10)
-	numGraphsPerChunk := 1000
+	numGraphsPerChunk := 1500
 
 	var outputs1 []types.SiacoinOutput
 	var outputs2 []types.SiacoinOutput
@@ -986,6 +984,8 @@ func TestBigTpool(t *testing.T) {
 		}
 	}
 
+	var size int
+
 	block, err = tpt.miner.AddBlock()
 	if err != nil {
 		t.Fatal(err)
@@ -999,6 +999,7 @@ func TestBigTpool(t *testing.T) {
 				minFee1 = fee
 			}
 		}
+		size += tx.MarshalSiaSize()
 	}
 
 	block, err = tpt.miner.AddBlock()
@@ -1018,6 +1019,8 @@ func TestBigTpool(t *testing.T) {
 				maxFee2 = fee
 			}
 		}
+		size += tx.MarshalSiaSize()
+
 	}
 
 	block, err = tpt.miner.AddBlock()
@@ -1037,6 +1040,8 @@ func TestBigTpool(t *testing.T) {
 				maxFee3 = fee
 			}
 		}
+		size += tx.MarshalSiaSize()
+
 	}
 
 	block, err = tpt.miner.AddBlock()
@@ -1049,7 +1054,12 @@ func TestBigTpool(t *testing.T) {
 				maxFee4 = fee
 			}
 		}
+		size += tx.MarshalSiaSize()
+
 	}
+
+	t.Log("\nTHE SIZE: ")
+	t.Log(size)
 
 	// Check that the total fees from each block are decreasing.
 	if totalFee1.Cmp(totalFee2) < 0 {
